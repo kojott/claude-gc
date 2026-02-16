@@ -1,0 +1,9 @@
+[Unit]
+Description=Claude Code orphaned process cleanup
+Documentation=https://github.com/kojott/claude-gc
+
+[Service]
+Type=oneshot
+ExecStart=%h/.claude/claude-gc.sh --force
+Nice=19
+IOSchedulingClass=idle
