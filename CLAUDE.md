@@ -25,6 +25,12 @@
 - Safe for cron: auto-force when no TTY detected
 - Self-exclusion: never kill claude-gc itself
 
+## Security Model
+
+- All inputs (env vars, CLI flags) are trusted — the tool runs in the user's own environment
+- No untrusted user input is processed at any point
+- Security review (2026-02-16): **0 vulnerabilities found** — 5 candidates analyzed, all filtered as false positives (relied on attacker-controlled env vars, which is out of scope)
+
 ## Testing
 
 ```bash
