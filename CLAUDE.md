@@ -10,20 +10,31 @@
 
 ## Algorithm
 
+### Phase 1: Orphaned Claude processes
 1. Find claude processes with no controlling terminal (TTY = `?` / `??`)
-2. Exclude: chroma-mcp, tmux, claude-gc itself
-3. Skip processes younger than `--min-age` (default 1800s)
-4. Walk parent chain up to 3 levels — protect children of active terminal sessions
-5. SIGTERM → wait 2s → SIGKILL survivors
-6. Log results to `~/.claude/claude-gc.log`
+2. Exclude: chroma-mcp, tmux, worker-service, mcp-server, claude-gc itself
+3. Collect active sessions: terminal claude sessions + background daemons (bun worker-service, node mcp-server)
+4. Skip processes younger than `--min-age` (default 1800s)
+5. Walk parent chain up to 3 levels — protect children of active sessions/daemons
+6. SIGTERM → wait 2s → SIGKILL survivors
+
+### Phase 2: Orphaned MCP server processes
+7. Scan for known MCP patterns (python/uv/node/bun/npm with mcp-related args)
+8. Filter by current user only (never touch other users' processes)
+9. Exclude worker-service and mcp-server daemons
+10. Walk parent chain up to 5 levels — protect processes with living claude ancestor
+11. Same SIGTERM → SIGKILL flow
+12. Log results to `~/.claude/claude-gc.log`
 
 ## Conventions
 
 - Pure bash — no external dependencies beyond coreutils/procps
 - Cross-platform: Linux + macOS (handle TTY markers, time formats, memory commands)
-- `set -euo pipefail` in all scripts
+- `set -euo pipefail` in all scripts — use `|| true` for arithmetic that can return 0
 - Safe for cron: auto-force when no TTY detected
 - Self-exclusion: never kill claude-gc itself
+- User-scoped: only target processes owned by current user
+- Daemon-aware: recognize worker-service/mcp-server as legitimate background parents
 
 ## Security Model
 

@@ -13,16 +13,28 @@ This is a known issue:
 
 ## How It Works
 
-claude-gc uses a three-layer safety algorithm:
+claude-gc uses a multi-layer safety algorithm to clean up two categories of orphans:
+
+### Phase 1: Orphaned Claude processes
 
 1. **Find** claude processes with no controlling terminal (detached from any session)
-2. **Exclude** protected processes: chroma-mcp (vector DB), tmux, and claude-gc itself
+2. **Exclude** protected processes: chroma-mcp (vector DB), tmux, worker-service/mcp-server daemons, and claude-gc itself
 3. **Skip** processes younger than 30 minutes (configurable) — they may still be initializing
-4. **Walk parent chain** up to 3 levels — if a detached process is a child/grandchild/great-grandchild of an active terminal session, it's protected
+4. **Walk parent chain** up to 3 levels — if a detached process is a child/grandchild/great-grandchild of an active terminal session or background daemon, it's protected
 5. **Graceful shutdown**: SIGTERM first, wait 2 seconds, then SIGKILL only for survivors
-6. **Log** results with timestamps and freed memory
 
-This means claude-gc will **never kill your active Claude Code session** or its working subprocesses.
+### Phase 2: Orphaned MCP server processes
+
+Claude Code spawns MCP servers (python, uv, node, bun, npm) that don't contain "claude" in their name. These are invisible to simple process matching and can accumulate rapidly — **1000+ orphaned python/uv processes** have been observed consuming 75GB+ on a 32GB server, causing OOM kills.
+
+6. **Scan** for known MCP patterns (`python.*mcp`, `uv.*mcp`, `node.*mcp`, `npm.*exec.*mcp`, `bun.*worker-service`, etc.)
+7. **Filter** by current user only — never touches processes owned by other users (e.g., Cursor's MCP servers running as root)
+8. **Verify ancestry** — walks 5 levels up the parent chain to check if any living claude process is an ancestor; if so, the MCP process is protected
+9. **Same graceful shutdown** as Phase 1
+
+Both phases **log** results with timestamps and freed memory.
+
+This means claude-gc will **never kill your active Claude Code session**, its working subprocesses, or MCP servers belonging to other tools.
 
 ## Quick Start
 
@@ -147,7 +159,7 @@ rm ~/.claude/claude-gc.log
 
 ### Will this kill my active Claude Code session?
 
-No. claude-gc only targets processes that have **no controlling terminal** (TTY = `?`). Your active terminal session and all its child processes are protected. Additionally, it walks the parent chain 3 levels deep to protect background workers of active sessions.
+No. claude-gc only targets processes that have **no controlling terminal** (TTY = `?`). Your active terminal session and all its child processes are protected. It walks the parent chain 3 levels deep for Claude processes and 5 levels deep for MCP processes. Background daemon parents (bun worker-service, node mcp-server) are recognized as legitimate orchestrators and their children are protected.
 
 ### Why 30 minutes minimum age?
 
@@ -159,7 +171,7 @@ Yes. Processes running inside tmux or screen have a TTY (the pseudo-terminal fro
 
 ### What about MCP servers?
 
-MCP servers that are children of an active Claude session are protected by the parent chain walk. Orphaned MCP servers (whose parent session has ended) will be cleaned up. chroma-mcp is always excluded.
+As of v1.1.0, claude-gc actively cleans up orphaned MCP servers (python, uv, node, bun, npm processes matching known MCP patterns). MCP servers that are children of an active Claude session are protected by the parent chain walk (5 levels deep). Orphaned MCP servers (whose parent session has ended) will be cleaned up. chroma-mcp and mcp-server daemons are always excluded. Only processes owned by the current user are targeted — MCP servers from other tools (e.g., Cursor) running under different users are never touched.
 
 ### Can I see what it's doing?
 
