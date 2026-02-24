@@ -23,7 +23,7 @@ set -euo pipefail
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 MIN_AGE="${CLAUDE_GC_MIN_AGE:-1800}"
 LOG_FILE="${CLAUDE_GC_LOG:-${HOME}/.claude/claude-gc.log}"
 LOG_ENABLED=true
@@ -191,6 +191,8 @@ while IFS= read -r line; do
     [[ "$cmd" == *chroma* ]] && continue
     [[ "$cmd" == *tmux* ]] && continue
     [[ "$cmd" == *claude-gc* ]] && continue
+    [[ "$cmd" == *worker-service* ]] && continue
+    [[ "$cmd" == *mcp-server* ]] && continue
 
     # Skip self
     [[ "$pid" -eq "$SELF_PID" ]] && continue
@@ -200,14 +202,16 @@ done < <(ps aux 2>/dev/null | grep -i '[c]laude' || true)
 
 if [[ ${#ORPHAN_PIDS[@]} -eq 0 ]]; then
     verbose "No orphaned claude processes found."
-    exit 0
 fi
 
 verbose "Found ${#ORPHAN_PIDS[@]} candidate processes (no TTY, claude-related)"
 
-# Step 2: Get active terminal claude sessions (have a TTY like pts/*)
+# Step 2: Get active claude sessions — both terminal AND known daemon parents
+# Include terminal sessions (pts/*) and background orchestrators (bun worker-service,
+# node mcp-server) that legitimately spawn claude subagents
 declare -a ACTIVE_PIDS=()
 
+# Terminal claude sessions
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     pid=$(echo "$line" | awk '{print $2}')
@@ -216,7 +220,14 @@ while IFS= read -r line; do
     ACTIVE_PIDS+=("$pid")
 done < <(ps aux 2>/dev/null | grep -i '[c]laude' || true)
 
-verbose "Found ${#ACTIVE_PIDS[@]} active terminal claude sessions"
+# Background daemon parents that legitimately own claude subagents
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    pid=$(echo "$line" | awk '{print $2}')
+    ACTIVE_PIDS+=("$pid")
+done < <(ps aux 2>/dev/null | grep -E 'bun.*worker-service|node.*mcp-server' | grep -v grep || true)
+
+verbose "Found ${#ACTIVE_PIDS[@]} active claude sessions/daemons"
 
 # Step 3: Filter — skip young processes and children of active sessions
 is_child_of_active() {
@@ -236,7 +247,7 @@ is_child_of_active() {
         done
 
         current_pid="$parent"
-        ((depth++))
+        (( depth++ )) || true
     done
     return 1
 }
@@ -269,61 +280,196 @@ for pid in "${ORPHAN_PIDS[@]}"; do
 done
 
 if [[ ${#KILL_PIDS[@]} -eq 0 ]]; then
-    verbose "No orphaned processes to clean up after filtering."
-    exit 0
+    verbose "No orphaned Claude processes to clean up after filtering."
 fi
 
-# Step 4: Confirm or kill
-KILL_COUNT=${#KILL_PIDS[@]}
+# Step 4+5: Kill orphaned Claude processes (if any)
+if [[ ${#KILL_PIDS[@]} -gt 0 ]]; then
+    KILL_COUNT=${#KILL_PIDS[@]}
 
-# Calculate total memory of targets
-TOTAL_RSS=0
-for pid in "${KILL_PIDS[@]}"; do
-    rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
-    TOTAL_RSS=$(( TOTAL_RSS + ${rss:-0} ))
-done
-TOTAL_MB=$(( TOTAL_RSS / 1024 ))
+    # Calculate total memory of targets
+    TOTAL_RSS=0
+    for pid in "${KILL_PIDS[@]}"; do
+        rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+        TOTAL_RSS=$(( TOTAL_RSS + ${rss:-0} ))
+    done
+    TOTAL_MB=$(( TOTAL_RSS / 1024 ))
 
-echo "Found $KILL_COUNT orphaned Claude process(es) using ~${TOTAL_MB}MB RAM"
+    echo "Found $KILL_COUNT orphaned Claude process(es) using ~${TOTAL_MB}MB RAM"
 
-if [[ "$DRY_RUN" == true ]]; then
-    echo "[DRY RUN] Would kill $KILL_COUNT process(es). Use without --dry-run to clean up."
-    log_msg "DRY RUN | Would kill $KILL_COUNT orphaned processes (~${TOTAL_MB}MB)"
-    exit 0
-fi
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[DRY RUN] Would kill $KILL_COUNT Claude process(es)."
+        log_msg "DRY RUN | Would kill $KILL_COUNT orphaned processes (~${TOTAL_MB}MB)"
+    elif [[ "$FORCE" != true ]]; then
+        echo ""
+        read -rp "Kill $KILL_COUNT orphaned process(es)? [y/N] " confirm
+        if [[ "$confirm" != [yY] ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    fi
 
-if [[ "$FORCE" != true ]]; then
-    echo ""
-    read -rp "Kill $KILL_COUNT orphaned process(es)? [y/N] " confirm
-    if [[ "$confirm" != [yY] ]]; then
-        echo "Aborted."
-        exit 0
+    if [[ "$DRY_RUN" != true ]]; then
+        MEM_BEFORE=$(get_used_memory_mb)
+        kill "${KILL_PIDS[@]}" 2>/dev/null || true
+        sleep 2
+
+        declare -a SURVIVORS=()
+        for pid in "${KILL_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                SURVIVORS+=("$pid")
+            fi
+        done
+
+        if [[ ${#SURVIVORS[@]} -gt 0 ]]; then
+            verbose "  ${#SURVIVORS[@]} process(es) survived SIGTERM, sending SIGKILL..."
+            kill -9 "${SURVIVORS[@]}" 2>/dev/null || true
+            sleep 1
+        fi
+
+        MEM_AFTER=$(get_used_memory_mb)
+        FREED=$(( MEM_BEFORE - MEM_AFTER ))
+        [[ "$FREED" -lt 0 ]] && FREED=0
+
+        echo "Killed $KILL_COUNT orphaned Claude process(es) | Freed ~${FREED}MB RAM"
+        log_msg "Killed $KILL_COUNT orphaned Claude processes | Freed ~${FREED}MB RAM"
     fi
 fi
 
-# Step 5: Kill — SIGTERM first, then SIGKILL
-MEM_BEFORE=$(get_used_memory_mb)
+# ── Step 6: Kill orphaned MCP child processes (python, uv, node, bun) ────────
+# These are spawned by Claude sessions but not matched by 'claude' grep.
+# Strategy: find processes whose parent is PID 1 (reparented orphans) or whose
+# ancestor claude process no longer exists, that match known MCP patterns.
 
-kill "${KILL_PIDS[@]}" 2>/dev/null || true
-sleep 2
+verbose ""
+verbose "── Scanning for orphaned MCP child processes ──"
 
-# Check which ones survived, SIGKILL those
-declare -a SURVIVORS=()
-for pid in "${KILL_PIDS[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-        SURVIVORS+=("$pid")
+# Collect all living claude PIDs (both terminal and background)
+declare -a ALL_CLAUDE_PIDS=()
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    ALL_CLAUDE_PIDS+=("$(echo "$line" | awk '{print $2}')")
+done < <(ps aux 2>/dev/null | grep -i '[c]laude' | grep -v claude-gc || true)
+
+# MCP process patterns - commands that indicate a Claude MCP server
+# Matches: uv tool run/uvx with mcp, python running mcp servers, npm exec mcp,
+# bun running claude plugins, node running mcp
+MCP_PATTERNS=(
+    'uv.*tool.*mcp'
+    'uv.*uvx.*mcp'
+    'uvx.*mcp'
+    'python.*mcp'
+    'python.*chroma'
+    'node.*mcp'
+    'node.*playwright-mcp'
+    'npm.*exec.*mcp'
+    'bun.*claude.*plugin'
+    'bun.*worker-service'
+)
+
+# Build a single grep pattern
+MCP_GREP_PATTERN=$(IFS='|'; echo "${MCP_PATTERNS[*]}")
+
+declare -a MCP_KILL_PIDS=()
+
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    pid=$(echo "$line" | awk '{print $2}')
+    tty=$(echo "$line" | awk '{print $7}')
+
+    # Only target processes without a TTY
+    [[ "$tty" != "$NO_TTY" ]] && continue
+
+    # Skip self
+    [[ "$pid" -eq "$SELF_PID" ]] && continue
+
+    # Skip daemon orchestrators (they legitimately run detached)
+    cmd_check=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    [[ "$cmd_check" == *worker-service* ]] && { verbose "  SKIP MCP pid=$pid (worker-service daemon)"; continue; }
+    [[ "$cmd_check" == *mcp-server* ]] && { verbose "  SKIP MCP pid=$pid (mcp-server daemon)"; continue; }
+
+    # Skip processes younger than min-age
+    elapsed=$(get_elapsed_seconds "$pid")
+    if [[ -n "$elapsed" && "$elapsed" -lt "$MIN_AGE" ]]; then
+        verbose "  SKIP MCP pid=$pid age=${elapsed}s (too young)"
+        continue
     fi
-done
 
-if [[ ${#SURVIVORS[@]} -gt 0 ]]; then
-    verbose "  ${#SURVIVORS[@]} process(es) survived SIGTERM, sending SIGKILL..."
-    kill -9 "${SURVIVORS[@]}" 2>/dev/null || true
-    sleep 1
+    # Check if any living claude process is an ancestor
+    has_claude_ancestor=false
+    current_pid="$pid"
+    depth=0
+    while [[ $depth -lt 5 ]]; do
+        parent=$(ps -o ppid= -p "$current_pid" 2>/dev/null | tr -d ' ')
+        [[ -z "$parent" || "$parent" == "0" || "$parent" == "1" ]] && break
+
+        for cpid in "${ALL_CLAUDE_PIDS[@]}"; do
+            if [[ "$parent" == "$cpid" ]]; then
+                has_claude_ancestor=true
+                break 2
+            fi
+        done
+
+        current_pid="$parent"
+        (( depth++ )) || true
+    done
+
+    # Also check if any active terminal session is an ancestor
+    if [[ "$has_claude_ancestor" == false && ${#ACTIVE_PIDS[@]} -gt 0 ]]; then
+        if is_child_of_active "$pid"; then
+            has_claude_ancestor=true
+        fi
+    fi
+
+    if [[ "$has_claude_ancestor" == false ]]; then
+        cmd_info=$(ps -o args= -p "$pid" 2>/dev/null || true)
+        cmd_info="${cmd_info:0:80}"
+        mem_rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+        mem_mb=$(( ${mem_rss:-0} / 1024 ))
+
+        verbose "  KILL MCP pid=$pid age=${elapsed:-?}s mem=${mem_mb}MB cmd=${cmd_info}"
+        MCP_KILL_PIDS+=("$pid")
+    else
+        verbose "  SKIP MCP pid=$pid (has living claude ancestor)"
+    fi
+# Only match processes owned by current user (avoid killing Cursor/other tools' MCP servers)
+done < <(ps aux 2>/dev/null | awk -v user="$(whoami)" '$1 == user' | grep -iE "$MCP_GREP_PATTERN" | grep -v grep | grep -v claude-gc || true)
+
+if [[ ${#MCP_KILL_PIDS[@]} -gt 0 ]]; then
+    MCP_KILL_COUNT=${#MCP_KILL_PIDS[@]}
+
+    MCP_TOTAL_RSS=0
+    for pid in "${MCP_KILL_PIDS[@]}"; do
+        rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+        MCP_TOTAL_RSS=$(( MCP_TOTAL_RSS + ${rss:-0} ))
+    done
+    MCP_TOTAL_MB=$(( MCP_TOTAL_RSS / 1024 ))
+
+    echo "Found $MCP_KILL_COUNT orphaned MCP process(es) using ~${MCP_TOTAL_MB}MB RAM"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[DRY RUN] Would kill $MCP_KILL_COUNT MCP process(es)."
+        log_msg "DRY RUN | Would kill $MCP_KILL_COUNT orphaned MCP processes (~${MCP_TOTAL_MB}MB)"
+    else
+        MEM_BEFORE_MCP=$(get_used_memory_mb)
+
+        kill "${MCP_KILL_PIDS[@]}" 2>/dev/null || true
+        sleep 2
+
+        # SIGKILL survivors
+        for pid in "${MCP_KILL_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+
+        MEM_AFTER_MCP=$(get_used_memory_mb)
+        MCP_FREED=$(( MEM_BEFORE_MCP - MEM_AFTER_MCP ))
+        [[ "$MCP_FREED" -lt 0 ]] && MCP_FREED=0
+
+        echo "Killed $MCP_KILL_COUNT orphaned MCP process(es) | Freed ~${MCP_FREED}MB RAM"
+        log_msg "Killed $MCP_KILL_COUNT orphaned MCP processes (~${MCP_TOTAL_MB}MB) | Freed ~${MCP_FREED}MB RAM"
+    fi
+else
+    verbose "No orphaned MCP processes found."
 fi
-
-MEM_AFTER=$(get_used_memory_mb)
-FREED=$(( MEM_BEFORE - MEM_AFTER ))
-[[ "$FREED" -lt 0 ]] && FREED=0
-
-echo "Killed $KILL_COUNT orphaned process(es) | Freed ~${FREED}MB RAM"
-log_msg "Killed $KILL_COUNT orphaned processes | Freed ~${FREED}MB RAM"
