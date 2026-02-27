@@ -7,24 +7,30 @@
 # This script safely identifies and kills them.
 #
 # Usage: claude-gc.sh [OPTIONS]
-#   --dry-run       Show what would be killed without killing
-#   --verbose       Print detailed output
-#   --force         Skip interactive confirmation (auto-enabled when no TTY)
-#   --min-age SECS  Minimum process age in seconds (default: 1800 = 30min)
-#   --log PATH      Log file path (default: ~/.claude/claude-gc.log)
-#   --no-log        Disable logging
-#   -h, --help      Show this help message
+#   --dry-run            Show what would be killed without killing
+#   --verbose            Print detailed output
+#   --force              Skip interactive confirmation (auto-enabled when no TTY)
+#   --min-age SECS       Minimum process age in seconds (default: 1800 = 30min)
+#   --max-age SECS       Force-kill even protected processes older than this (default: 14400 = 4h)
+#   --max-daemon-age SECS  Force-kill daemon processes older than this (default: 86400 = 24h)
+#   --log PATH           Log file path (default: ~/.claude/claude-gc.log)
+#   --no-log             Disable logging
+#   -h, --help           Show this help message
 #
 # Environment variables:
-#   CLAUDE_GC_MIN_AGE   Override default min-age (seconds)
-#   CLAUDE_GC_LOG       Override default log path
+#   CLAUDE_GC_MIN_AGE        Override default min-age (seconds)
+#   CLAUDE_GC_MAX_AGE        Override default max-age (seconds)
+#   CLAUDE_GC_MAX_DAEMON_AGE Override default max-daemon-age (seconds)
+#   CLAUDE_GC_LOG            Override default log path
 
 set -euo pipefail
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 MIN_AGE="${CLAUDE_GC_MIN_AGE:-1800}"
+MAX_AGE="${CLAUDE_GC_MAX_AGE:-14400}"
+MAX_DAEMON_AGE="${CLAUDE_GC_MAX_DAEMON_AGE:-86400}"
 LOG_FILE="${CLAUDE_GC_LOG:-${HOME}/.claude/claude-gc.log}"
 LOG_ENABLED=true
 DRY_RUN=false
@@ -55,22 +61,28 @@ claude-gc — Automatic cleanup for orphaned Claude Code processes
 Usage: claude-gc.sh [OPTIONS]
 
 Options:
-  --dry-run       Show what would be killed without killing
-  --verbose       Print detailed output
-  --force         Skip interactive confirmation
-  --min-age SECS  Minimum process age in seconds (default: 1800)
-  --log PATH      Log file path (default: ~/.claude/claude-gc.log)
-  --no-log        Disable logging
-  -h, --help      Show this help message
+  --dry-run            Show what would be killed without killing
+  --verbose            Print detailed output
+  --force              Skip interactive confirmation
+  --min-age SECS       Minimum process age before eligible for cleanup (default: 1800 = 30min)
+  --max-age SECS       Force-kill even protected processes older than this (default: 14400 = 4h)
+  --max-daemon-age SECS  Force-kill daemon processes older than this (default: 86400 = 24h)
+  --log PATH           Log file path (default: ~/.claude/claude-gc.log)
+  --no-log             Disable logging
+  -h, --help           Show this help message
 
 Environment variables:
-  CLAUDE_GC_MIN_AGE   Override default min-age (seconds)
-  CLAUDE_GC_LOG       Override default log path
+  CLAUDE_GC_MIN_AGE        Override default min-age (seconds)
+  CLAUDE_GC_MAX_AGE        Override default max-age (seconds)
+  CLAUDE_GC_MAX_DAEMON_AGE Override default max-daemon-age (seconds)
+  CLAUDE_GC_LOG            Override default log path
 
 Examples:
-  claude-gc.sh --dry-run --verbose    # Preview what would be cleaned
-  claude-gc.sh --force                # Clean without confirmation (cron use)
-  claude-gc.sh --min-age 900          # Kill processes older than 15 minutes
+  claude-gc.sh --dry-run --verbose       # Preview what would be cleaned
+  claude-gc.sh --force                   # Clean without confirmation (cron use)
+  claude-gc.sh --min-age 900             # Kill processes older than 15 minutes
+  claude-gc.sh --max-age 3600            # Force-kill protected processes after 1 hour
+  claude-gc.sh --max-daemon-age 43200    # Force-kill daemons after 12 hours
 EOF
     exit 0
 }
@@ -81,6 +93,8 @@ while [[ $# -gt 0 ]]; do
         --verbose)   VERBOSE=true; shift ;;
         --force)     FORCE=true; shift ;;
         --min-age)   MIN_AGE="$2"; shift 2 ;;
+        --max-age)   MAX_AGE="$2"; shift 2 ;;
+        --max-daemon-age) MAX_DAEMON_AGE="$2"; shift 2 ;;
         --log)       LOG_FILE="$2"; shift 2 ;;
         --no-log)    LOG_ENABLED=false; shift ;;
         -h|--help)   usage ;;
@@ -168,7 +182,7 @@ no_tty_marker() {
 
 # ── Main logic ───────────────────────────────────────────────────────────────
 
-verbose "claude-gc v${VERSION} — platform: ${PLATFORM}, min-age: ${MIN_AGE}s"
+verbose "claude-gc v${VERSION} — platform: ${PLATFORM}, min-age: ${MIN_AGE}s, max-age: ${MAX_AGE}s, max-daemon-age: ${MAX_DAEMON_AGE}s"
 verbose ""
 
 SELF_PID=$$
@@ -176,7 +190,9 @@ NO_TTY="$(no_tty_marker)"
 
 # Step 1: Find claude processes with no controlling terminal
 # Exclude: chroma-mcp (persistent vector DB), tmux (session manager), claude-gc itself
+# Daemon processes (worker-service, mcp-server) are tracked separately for --max-daemon-age
 declare -a ORPHAN_PIDS=()
+declare -a DAEMON_PIDS=()
 
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -191,11 +207,15 @@ while IFS= read -r line; do
     [[ "$cmd" == *chroma* ]] && continue
     [[ "$cmd" == *tmux* ]] && continue
     [[ "$cmd" == *claude-gc* ]] && continue
-    [[ "$cmd" == *worker-service* ]] && continue
-    [[ "$cmd" == *mcp-server* ]] && continue
 
     # Skip self
     [[ "$pid" -eq "$SELF_PID" ]] && continue
+
+    # Track daemons separately (subject to --max-daemon-age instead of --max-age)
+    if [[ "$cmd" == *worker-service* ]] || [[ "$cmd" == *mcp-server* ]]; then
+        DAEMON_PIDS+=("$pid")
+        continue
+    fi
 
     ORPHAN_PIDS+=("$pid")
 done < <(ps aux 2>/dev/null | grep -i '[c]laude' || true)
@@ -204,7 +224,7 @@ if [[ ${#ORPHAN_PIDS[@]} -eq 0 ]]; then
     verbose "No orphaned claude processes found."
 fi
 
-verbose "Found ${#ORPHAN_PIDS[@]} candidate processes (no TTY, claude-related)"
+verbose "Found ${#ORPHAN_PIDS[@]} candidate processes (no TTY, claude-related) + ${#DAEMON_PIDS[@]} daemon(s)"
 
 # Step 2: Get active claude sessions — both terminal AND known daemon parents
 # Include terminal sessions (pts/*) and background orchestrators (bun worker-service,
@@ -253,6 +273,7 @@ is_child_of_active() {
 }
 
 declare -a KILL_PIDS=()
+MAX_AGE_KILLS=0
 
 for pid in "${ORPHAN_PIDS[@]}"; do
     # Skip processes younger than min-age
@@ -262,9 +283,21 @@ for pid in "${ORPHAN_PIDS[@]}"; do
         continue
     fi
 
+    # Force-kill if older than max-age, regardless of parent chain
+    if [[ -n "$elapsed" && "$elapsed" -ge "$MAX_AGE" ]]; then
+        cmd_info=$(ps -o args= -p "$pid" 2>/dev/null || true)
+        cmd_info="${cmd_info:0:80}"
+        mem_rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+        mem_mb=$(( ${mem_rss:-0} / 1024 ))
+        verbose "  FORCE-KILL pid=$pid age=${elapsed}s (exceeds max-age ${MAX_AGE}s) mem=${mem_mb}MB cmd=${cmd_info}"
+        KILL_PIDS+=("$pid")
+        (( MAX_AGE_KILLS++ )) || true
+        continue
+    fi
+
     # Skip if child of an active terminal session (walk parent chain)
     if [[ ${#ACTIVE_PIDS[@]} -gt 0 ]] && is_child_of_active "$pid"; then
-        verbose "  SKIP pid=$pid (child of active terminal session)"
+        verbose "  SKIP pid=$pid age=${elapsed:-?}s (child of active session)"
         continue
     fi
 
@@ -277,6 +310,23 @@ for pid in "${ORPHAN_PIDS[@]}"; do
 
     verbose "  KILL pid=$pid age=${elapsed:-?}s mem=${mem_mb}MB cmd=${cmd_info}"
     KILL_PIDS+=("$pid")
+done
+
+# Check daemon processes against --max-daemon-age
+DAEMON_KILLS=0
+for pid in "${DAEMON_PIDS[@]}"; do
+    elapsed=$(get_elapsed_seconds "$pid")
+    if [[ -n "$elapsed" && "$elapsed" -ge "$MAX_DAEMON_AGE" ]]; then
+        cmd_info=$(ps -o args= -p "$pid" 2>/dev/null || true)
+        cmd_info="${cmd_info:0:80}"
+        mem_rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+        mem_mb=$(( ${mem_rss:-0} / 1024 ))
+        verbose "  FORCE-KILL DAEMON pid=$pid age=${elapsed}s (exceeds max-daemon-age ${MAX_DAEMON_AGE}s) mem=${mem_mb}MB cmd=${cmd_info}"
+        KILL_PIDS+=("$pid")
+        (( DAEMON_KILLS++ )) || true
+    else
+        verbose "  SKIP DAEMON pid=$pid age=${elapsed:-?}s (within max-daemon-age ${MAX_DAEMON_AGE}s)"
+    fi
 done
 
 if [[ ${#KILL_PIDS[@]} -eq 0 ]]; then
@@ -331,8 +381,11 @@ if [[ ${#KILL_PIDS[@]} -gt 0 ]]; then
         FREED=$(( MEM_BEFORE - MEM_AFTER ))
         [[ "$FREED" -lt 0 ]] && FREED=0
 
-        echo "Killed $KILL_COUNT orphaned Claude process(es) | Freed ~${FREED}MB RAM"
-        log_msg "Killed $KILL_COUNT orphaned Claude processes | Freed ~${FREED}MB RAM"
+        local override_info=""
+        [[ $MAX_AGE_KILLS -gt 0 ]] && override_info=" ($MAX_AGE_KILLS max-age override(s))"
+        [[ $DAEMON_KILLS -gt 0 ]] && override_info="${override_info} ($DAEMON_KILLS daemon(s))"
+        echo "Killed $KILL_COUNT orphaned Claude process(es)${override_info} | Freed ~${FREED}MB RAM"
+        log_msg "Killed $KILL_COUNT orphaned Claude processes${override_info} | Freed ~${FREED}MB RAM"
     fi
 fi
 
@@ -383,15 +436,41 @@ while IFS= read -r line; do
     # Skip self
     [[ "$pid" -eq "$SELF_PID" ]] && continue
 
-    # Skip daemon orchestrators (they legitimately run detached)
+    # Check if this is a daemon orchestrator
     cmd_check=$(ps -o args= -p "$pid" 2>/dev/null || true)
-    [[ "$cmd_check" == *worker-service* ]] && { verbose "  SKIP MCP pid=$pid (worker-service daemon)"; continue; }
-    [[ "$cmd_check" == *mcp-server* ]] && { verbose "  SKIP MCP pid=$pid (mcp-server daemon)"; continue; }
+    is_daemon=false
+    if [[ "$cmd_check" == *worker-service* ]] || [[ "$cmd_check" == *mcp-server* ]]; then
+        is_daemon=true
+    fi
 
     # Skip processes younger than min-age
     elapsed=$(get_elapsed_seconds "$pid")
     if [[ -n "$elapsed" && "$elapsed" -lt "$MIN_AGE" ]]; then
         verbose "  SKIP MCP pid=$pid age=${elapsed}s (too young)"
+        continue
+    fi
+
+    # Daemon orchestrators: only kill if exceeding max-daemon-age
+    if [[ "$is_daemon" == true ]]; then
+        if [[ -n "$elapsed" && "$elapsed" -ge "$MAX_DAEMON_AGE" ]]; then
+            cmd_info="${cmd_check:0:80}"
+            mem_rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+            mem_mb=$(( ${mem_rss:-0} / 1024 ))
+            verbose "  FORCE-KILL MCP DAEMON pid=$pid age=${elapsed}s (exceeds max-daemon-age ${MAX_DAEMON_AGE}s) mem=${mem_mb}MB cmd=${cmd_info}"
+            MCP_KILL_PIDS+=("$pid")
+        else
+            verbose "  SKIP MCP pid=$pid (${is_daemon:+daemon }within max-daemon-age ${MAX_DAEMON_AGE}s)"
+        fi
+        continue
+    fi
+
+    # Force-kill non-daemon MCP processes older than max-age, regardless of ancestry
+    if [[ -n "$elapsed" && "$elapsed" -ge "$MAX_AGE" ]]; then
+        cmd_info="${cmd_check:0:80}"
+        mem_rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+        mem_mb=$(( ${mem_rss:-0} / 1024 ))
+        verbose "  FORCE-KILL MCP pid=$pid age=${elapsed}s (exceeds max-age ${MAX_AGE}s) mem=${mem_mb}MB cmd=${cmd_info}"
+        MCP_KILL_PIDS+=("$pid")
         continue
     fi
 
@@ -422,15 +501,14 @@ while IFS= read -r line; do
     fi
 
     if [[ "$has_claude_ancestor" == false ]]; then
-        cmd_info=$(ps -o args= -p "$pid" 2>/dev/null || true)
-        cmd_info="${cmd_info:0:80}"
+        cmd_info="${cmd_check:0:80}"
         mem_rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
         mem_mb=$(( ${mem_rss:-0} / 1024 ))
 
         verbose "  KILL MCP pid=$pid age=${elapsed:-?}s mem=${mem_mb}MB cmd=${cmd_info}"
         MCP_KILL_PIDS+=("$pid")
     else
-        verbose "  SKIP MCP pid=$pid (has living claude ancestor)"
+        verbose "  SKIP MCP pid=$pid age=${elapsed:-?}s (has living claude ancestor)"
     fi
 # Only match processes owned by current user (avoid killing Cursor/other tools' MCP servers)
 done < <(ps aux 2>/dev/null | awk -v user="$(whoami)" '$1 == user' | grep -iE "$MCP_GREP_PATTERN" | grep -v grep | grep -v claude-gc || true)

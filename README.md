@@ -64,13 +64,15 @@ chmod +x ~/.claude/claude-gc.sh
 claude-gc.sh [OPTIONS]
 
 Options:
-  --dry-run       Show what would be killed without killing
-  --verbose       Print detailed output
-  --force         Skip interactive confirmation
-  --min-age SECS  Minimum process age in seconds (default: 1800)
-  --log PATH      Log file path (default: ~/.claude/claude-gc.log)
-  --no-log        Disable logging
-  -h, --help      Show this help message
+  --dry-run            Show what would be killed without killing
+  --verbose            Print detailed output
+  --force              Skip interactive confirmation
+  --min-age SECS       Minimum process age before eligible for cleanup (default: 1800 = 30min)
+  --max-age SECS       Force-kill even protected processes older than this (default: 14400 = 4h)
+  --max-daemon-age SECS  Force-kill daemon processes older than this (default: 86400 = 24h)
+  --log PATH           Log file path (default: ~/.claude/claude-gc.log)
+  --no-log             Disable logging
+  -h, --help           Show this help message
 ```
 
 ### Examples
@@ -85,6 +87,12 @@ claude-gc.sh --force
 # More aggressive: kill processes older than 10 minutes
 claude-gc.sh --force --min-age 600
 
+# Force-kill protected processes after 1 hour (instead of default 4h)
+claude-gc.sh --force --max-age 3600
+
+# Force-kill daemons after 12 hours (instead of default 24h)
+claude-gc.sh --force --max-daemon-age 43200
+
 # Verbose with custom log
 claude-gc.sh --force --verbose --log /tmp/claude-gc.log
 ```
@@ -93,7 +101,9 @@ claude-gc.sh --force --verbose --log /tmp/claude-gc.log
 
 | Option | Env Variable | Default | Description |
 |--------|-------------|---------|-------------|
-| `--min-age` | `CLAUDE_GC_MIN_AGE` | `1800` (30 min) | Minimum process age before cleanup |
+| `--min-age` | `CLAUDE_GC_MIN_AGE` | `1800` (30 min) | Minimum process age before eligible for cleanup |
+| `--max-age` | `CLAUDE_GC_MAX_AGE` | `14400` (4 hours) | Force-kill even protected processes older than this |
+| `--max-daemon-age` | `CLAUDE_GC_MAX_DAEMON_AGE` | `86400` (24 hours) | Force-kill daemon processes (worker-service, mcp-server) older than this |
 | `--log` | `CLAUDE_GC_LOG` | `~/.claude/claude-gc.log` | Log file path |
 | — | `CLAUDE_GC_INSTALL_DIR` | `~/.claude` | Installation directory (install.sh) |
 | — | `CLAUDE_GC_CRON_INTERVAL` | `15` | Cron interval in minutes (install.sh) |
@@ -161,6 +171,8 @@ rm ~/.claude/claude-gc.log
 
 No. claude-gc only targets processes that have **no controlling terminal** (TTY = `?`). Your active terminal session and all its child processes are protected. It walks the parent chain 3 levels deep for Claude processes and 5 levels deep for MCP processes. Background daemon parents (bun worker-service, node mcp-server) are recognized as legitimate orchestrators and their children are protected.
 
+**Note:** As of v1.2.0, processes older than `--max-age` (default: 4 hours) are force-killed even if they have a living parent, because no legitimate subagent should run that long. Daemons have a separate `--max-daemon-age` (default: 24 hours).
+
 ### Why 30 minutes minimum age?
 
 Some Claude Code operations (like complex multi-agent tasks) spawn long-running background processes that are still working. The 30-minute default gives them time to finish. You can lower this with `--min-age` if you want more aggressive cleanup.
@@ -171,7 +183,9 @@ Yes. Processes running inside tmux or screen have a TTY (the pseudo-terminal fro
 
 ### What about MCP servers?
 
-As of v1.1.0, claude-gc actively cleans up orphaned MCP servers (python, uv, node, bun, npm processes matching known MCP patterns). MCP servers that are children of an active Claude session are protected by the parent chain walk (5 levels deep). Orphaned MCP servers (whose parent session has ended) will be cleaned up. chroma-mcp and mcp-server daemons are always excluded. Only processes owned by the current user are targeted — MCP servers from other tools (e.g., Cursor) running under different users are never touched.
+As of v1.1.0, claude-gc actively cleans up orphaned MCP servers (python, uv, node, bun, npm processes matching known MCP patterns). MCP servers that are children of an active Claude session are protected by the parent chain walk (5 levels deep). Orphaned MCP servers (whose parent session has ended) will be cleaned up. Only processes owned by the current user are targeted — MCP servers from other tools (e.g., Cursor) running under different users are never touched.
+
+As of v1.2.0, even protected MCP processes are force-killed after `--max-age` (default: 4h), and daemon processes (worker-service, mcp-server) after `--max-daemon-age` (default: 24h).
 
 ### Can I see what it's doing?
 

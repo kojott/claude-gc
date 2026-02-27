@@ -3,9 +3,11 @@
 # Usage: curl -fsSL https://raw.githubusercontent.com/kojott/claude-gc/main/install.sh | bash
 #
 # Environment variables:
-#   CLAUDE_GC_INSTALL_DIR   Installation directory (default: ~/.claude)
-#   CLAUDE_GC_CRON_INTERVAL Cron interval in minutes (default: 15)
-#   CLAUDE_GC_USE_SYSTEMD   Set to "1" to prefer systemd over cron on Linux
+#   CLAUDE_GC_INSTALL_DIR    Installation directory (default: ~/.claude)
+#   CLAUDE_GC_CRON_INTERVAL  Cron interval in minutes (default: 15)
+#   CLAUDE_GC_USE_SYSTEMD    Set to "1" to prefer systemd over cron on Linux
+#   CLAUDE_GC_MAX_AGE        Max process age before force-kill (default: 14400 = 4h)
+#   CLAUDE_GC_MAX_DAEMON_AGE Max daemon age before force-kill (default: 86400 = 24h)
 
 set -euo pipefail
 
