@@ -381,7 +381,7 @@ if [[ ${#KILL_PIDS[@]} -gt 0 ]]; then
         FREED=$(( MEM_BEFORE - MEM_AFTER ))
         [[ "$FREED" -lt 0 ]] && FREED=0
 
-        local override_info=""
+        override_info=""
         [[ $MAX_AGE_KILLS -gt 0 ]] && override_info=" ($MAX_AGE_KILLS max-age override(s))"
         [[ $DAEMON_KILLS -gt 0 ]] && override_info="${override_info} ($DAEMON_KILLS daemon(s))"
         echo "Killed $KILL_COUNT orphaned Claude process(es)${override_info} | Freed ~${FREED}MB RAM"
